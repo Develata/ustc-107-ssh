@@ -19,6 +19,11 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 url = "2"
+russh = { version = "0.62", features = ["ring"] }
+bytes = "1"
+dirs = "6"
+getrandom = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 
 [dev-dependencies]
 assert_cmd = "2"
