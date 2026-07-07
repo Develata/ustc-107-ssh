@@ -1,13 +1,19 @@
+use aes::Aes128;
 use anyhow::{bail, Context, Result};
+use base64::prelude::*;
 use bytes::Bytes;
 use clap::{Args, Parser, Subcommand};
+use ecb::cipher::{block_padding::Pkcs7, BlockEncryptMut, KeyInit};
+use ecb::Encryptor;
 use futures_util::{SinkExt, StreamExt};
+use reqwest::header::{CONTENT_TYPE, REFERER};
 use russh::keys::{self, Algorithm, PrivateKey};
 use russh::server::{self, Msg, Server as _, Session};
 use russh::{Channel, ChannelId};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
+use std::io::{self, Write};
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -17,7 +23,9 @@ use tokio::net::TcpListener;
 use tokio::sync::{mpsc, Mutex};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::tungstenite::http::header::{COOKIE, LOCATION, ORIGIN, USER_AGENT};
+use tokio_tungstenite::tungstenite::http::header::{
+    COOKIE, LOCATION, ORIGIN, SET_COOKIE, USER_AGENT,
+};
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, error, info, warn};
 use url::Url;
@@ -32,6 +40,8 @@ const DEFAULT_USER_AGENT: &str =
 const BROWSER_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36 Edg/149.0.0.0";
 const ENV_COOKIE: &str = "USTC_107_COOKIE";
 const AUTH_CHECK_URL: &str = "https://107.ustc.edu.cn/api/auth";
+const USTC_107_OAUTH_START_URL: &str = "https://107.ustc.edu.cn/auth/public/ustc/oauth/start";
+const USTC_107_HOST: &str = "107.ustc.edu.cn";
 const DEFAULT_LISTEN: &str = "127.0.0.1:3000";
 const CONFIG_DIR_NAME: &str = "ustc-107-ssh";
 const HOST_KEY_FILE: &str = "host_key";
@@ -81,6 +91,8 @@ enum Command {
     Url(TargetArgs),
     /// Check local assumptions, cookie source presence, and optionally auth status.
     Doctor(DoctorArgs),
+    /// Headless USTC unified-auth login and import the resulting 107 Cookie.
+    Login(LoginArgs),
     /// Manage local cookie material without printing secret values.
     Cookie {
         #[command(subcommand)]
@@ -177,6 +189,28 @@ enum CookieCommand {
     Path,
     /// Inspect cookie names/count without printing values.
     Inspect(SessionArgs),
+}
+
+#[derive(Debug, Args)]
+struct LoginArgs {
+    #[command(flatten)]
+    target: TargetArgs,
+
+    /// USTC unified-auth username/student id. Prompts if omitted.
+    #[arg(long)]
+    username: Option<String>,
+
+    /// USTC unified-auth password. Prefer prompt; env/CLI use is intentionally not provided.
+    #[arg(long, hide = true)]
+    password: Option<String>,
+
+    /// Destination cookie file. Defaults to ~/.config/ustc-107-ssh/cookie.txt.
+    #[arg(long)]
+    output: Option<PathBuf>,
+
+    /// Skip the browser-compatible probe after importing the cookie.
+    #[arg(long, default_value_t = false)]
+    no_verify: bool,
 }
 
 #[derive(Debug, Args)]
@@ -289,6 +323,7 @@ async fn main() -> Result<()> {
             println!("{}", build_ws_url(&args)?);
         }
         Command::Doctor(args) => doctor(args).await?,
+        Command::Login(args) => login(args).await?,
         Command::Cookie { command } => cookie_command(command)?,
         Command::Probe(args) => probe(args).await?,
         Command::Attach(args) => attach(args).await?,
@@ -480,6 +515,343 @@ async fn auth_check(args: &SessionArgs, cookie: &str) -> Result<()> {
     Ok(())
 }
 
+type Aes128EcbEnc = Encryptor<Aes128>;
+
+#[derive(Debug, Clone)]
+struct CasLoginForm {
+    action: String,
+    execution: String,
+    croypto: String,
+}
+
+#[derive(Debug, Default, Clone)]
+struct SimpleCookieJar {
+    values: HashMap<String, String>,
+}
+
+impl SimpleCookieJar {
+    fn store_from_response(&mut self, response: &reqwest::Response) {
+        for value in response.headers().get_all(SET_COOKIE.as_str()) {
+            let Ok(text) = value.to_str() else {
+                continue;
+            };
+            let pair = text.split_once(';').map_or(text, |(pair, _)| pair);
+            let Some((name, value)) = pair.split_once('=') else {
+                continue;
+            };
+            let name = name.trim();
+            if !name.is_empty() {
+                self.values
+                    .insert(name.to_string(), value.trim().to_string());
+            }
+        }
+    }
+
+    fn header_for_host(&self, host: &str) -> String {
+        let mut items: Vec<_> = self.values.iter().collect();
+        items.sort_by(|a, b| a.0.cmp(b.0));
+        items
+            .into_iter()
+            .filter(|(name, _)| host != USTC_107_HOST || is_107_cookie_name(name))
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+}
+
+fn is_107_cookie_name(name: &str) -> bool {
+    name == "SCOW_USER" || name == "scow-dark" || name.starts_with("_ga")
+}
+
+fn prompt_line(prompt: &str) -> Result<String> {
+    print!("{prompt}");
+    io::stdout().flush()?;
+    let mut line = String::new();
+    io::stdin().read_line(&mut line)?;
+    Ok(line.trim_end_matches(['\r', '\n']).to_string())
+}
+
+async fn login(args: LoginArgs) -> Result<()> {
+    let username = match args.username {
+        Some(value) => value,
+        None => prompt_line("USTC username/student id: ")?,
+    };
+    let password = match args.password {
+        Some(value) => value,
+        None => rpassword::prompt_password("USTC password: ")?,
+    };
+    if username.trim().is_empty() || password.is_empty() {
+        bail!("username/password must not be empty");
+    }
+
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent(BROWSER_USER_AGENT)
+        .build()
+        .context("build login HTTP client")?;
+    let mut jar = SimpleCookieJar::default();
+
+    println!("login_step: start_107_oauth");
+    let cas_html = get_until_cas_login(&client, &mut jar).await?;
+    let form = parse_cas_login_form(&cas_html)?;
+    println!("login_step: cas_form_loaded");
+
+    let encrypted_password = aes_ecb_pkcs7_encrypt_base64(&form.croypto, &password)?;
+    let params = [
+        ("type", "UsernamePassword".to_string()),
+        ("_eventId", "submit".to_string()),
+        ("geolocation", String::new()),
+        ("execution", form.execution.clone()),
+        ("croypto", form.croypto.clone()),
+        ("username", username.trim().to_string()),
+        ("password", encrypted_password),
+    ];
+
+    let mut current = absolute_url("https://id.ustc.edu.cn/cas/", &form.action)?;
+    println!("login_step: submit_cas_credentials");
+    let mut response = request_with_jar(
+        &client,
+        reqwest::Method::POST,
+        &current,
+        &mut jar,
+        Some("https://id.ustc.edu.cn/cas/login"),
+        Some(&params),
+    )
+    .await?;
+
+    for _ in 0..12 {
+        let status = response.status();
+        if status.is_redirection() {
+            let location = response
+                .headers()
+                .get(LOCATION.as_str())
+                .and_then(|value| value.to_str().ok())
+                .context("login redirect without Location")?;
+            current = absolute_url(&current, location)?;
+            let redacted = redact_login_url(&current);
+            println!("login_step: redirect {redacted}");
+            response = request_with_jar(
+                &client,
+                reqwest::Method::GET,
+                &current,
+                &mut jar,
+                None,
+                None::<&[(&str, String)]>,
+            )
+            .await?;
+            continue;
+        }
+
+        let body = response.text().await.context("read login response body")?;
+        if body.contains("动态口令")
+            || body.contains("短信")
+            || body.contains("验证码")
+            || body.contains("checkTokenResult")
+        {
+            bail!("CAS requested second-factor verification; SMS/phone-code flow is detected but not implemented in this slice");
+        }
+        if body.contains("用户名/密码") || body.contains("密码错误") || body.contains("无效")
+        {
+            bail!("CAS returned a username/password failure page");
+        }
+        break;
+    }
+
+    let cookie = jar.header_for_host(USTC_107_HOST);
+    if cookie.is_empty() || !cookie_names(&cookie).iter().any(|name| name == "SCOW_USER") {
+        bail!("login completed without a usable 107 SCOW_USER cookie; USTC CAS may have required an unsupported extra step");
+    }
+
+    let output = args.output.unwrap_or(default_cookie_path()?);
+    write_cookie_file(&output, &cookie)?;
+    println!("cookie_file: {}", output.display());
+    println!("cookie: imported ({})", cookie_summary(&cookie));
+    print_cookie_warnings(&cookie);
+    println!("cookie_hint: {}", cookie_hint(&cookie));
+
+    if !args.no_verify {
+        println!("login_step: verify_probe");
+        let probe_args = ProbeArgs {
+            session: SessionArgs {
+                target: args.target,
+                cookie: Some(cookie),
+                cookie_file: None,
+                cookie_stdin: false,
+                origin: DEFAULT_ORIGIN.to_string(),
+                user_agent: DEFAULT_USER_AGENT.to_string(),
+                insecure_tls: false,
+                no_initial_resize: false,
+            },
+            command: "echo USTC_107_LOGIN_PROBE".to_string(),
+            read_seconds: 12,
+            pre_read_seconds: 8,
+            enter: "cr".to_string(),
+            browser_compatible: true,
+            send_delay_ms: 1000,
+        };
+        probe(probe_args).await?;
+    }
+    Ok(())
+}
+
+async fn get_until_cas_login(
+    client: &reqwest::Client,
+    jar: &mut SimpleCookieJar,
+) -> Result<String> {
+    let mut current = USTC_107_OAUTH_START_URL.to_string();
+    for _ in 0..8 {
+        let response = request_with_jar(
+            client,
+            reqwest::Method::GET,
+            &current,
+            jar,
+            None,
+            None::<&[(&str, String)]>,
+        )
+        .await?;
+        if response.status().is_redirection() {
+            let location = response
+                .headers()
+                .get(LOCATION.as_str())
+                .and_then(|value| value.to_str().ok())
+                .context("oauth redirect without Location")?;
+            current = absolute_url(&current, location)?;
+            continue;
+        }
+        let body = response.text().await.context("read CAS login page")?;
+        if body.contains("login-page-flowkey") && body.contains("login-croypto") {
+            return Ok(body);
+        }
+        bail!("unexpected non-CAS page while following USTC OAuth start");
+    }
+    bail!("too many redirects while starting USTC OAuth")
+}
+
+async fn request_with_jar<T: serde::Serialize + ?Sized>(
+    client: &reqwest::Client,
+    method: reqwest::Method,
+    url: &str,
+    jar: &mut SimpleCookieJar,
+    referer: Option<&str>,
+    form: Option<&T>,
+) -> Result<reqwest::Response> {
+    let host = Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(ToOwned::to_owned))
+        .unwrap_or_default();
+    let mut request = client.request(method, url);
+    let cookie = jar.header_for_host(&host);
+    if !cookie.is_empty() {
+        request = request.header(reqwest::header::COOKIE, cookie);
+    }
+    if let Some(referer) = referer {
+        request = request.header(REFERER, referer);
+    }
+    if let Some(form) = form {
+        request = request
+            .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .form(form);
+    }
+    let response = request
+        .send()
+        .await
+        .with_context(|| format!("request {url}"))?;
+    jar.store_from_response(&response);
+    Ok(response)
+}
+
+fn parse_cas_login_form(html: &str) -> Result<CasLoginForm> {
+    let execution = extract_tag_text_by_id(html, "login-page-flowkey")
+        .context("missing CAS login-page-flowkey")?;
+    let croypto =
+        extract_tag_text_by_id(html, "login-croypto").context("missing CAS login-croypto")?;
+    let action = extract_form_action(html).unwrap_or_else(|| "login".to_string());
+    Ok(CasLoginForm {
+        action,
+        execution,
+        croypto,
+    })
+}
+
+fn extract_tag_text_by_id(html: &str, id: &str) -> Option<String> {
+    let marker = format!("id=\"{id}\"");
+    let start = html.find(&marker)?;
+    let after = &html[start..];
+    let gt = after.find('>')? + 1;
+    let rest = &after[gt..];
+    let end = rest.find('<')?;
+    Some(html_unescape(rest[..end].trim()))
+}
+
+fn extract_form_action(html: &str) -> Option<String> {
+    let idx = html.find("<form")?;
+    let form_end = html[idx..].find('>').map(|n| idx + n + 1)?;
+    let form = &html[idx..form_end];
+    for needle in ["action=\"", "action='"] {
+        if let Some(pos) = form.find(needle) {
+            let rest = &form[pos + needle.len()..];
+            let quote = needle.chars().last()?;
+            let end = rest.find(quote)?;
+            let value = rest[..end].trim();
+            if !value.is_empty() {
+                return Some(html_unescape(value));
+            }
+        }
+    }
+    None
+}
+
+fn html_unescape(value: &str) -> String {
+    value
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+}
+
+fn absolute_url(base: &str, location: &str) -> Result<String> {
+    let base = Url::parse(base)?;
+    Ok(base.join(location)?.to_string())
+}
+
+fn redact_login_url(url: &str) -> String {
+    Url::parse(url)
+        .map(|mut parsed| {
+            parsed.set_query(None);
+            parsed.to_string()
+        })
+        .unwrap_or_else(|_| url.to_string())
+}
+
+fn aes_ecb_pkcs7_encrypt_base64(base64_key: &str, plaintext: &str) -> Result<String> {
+    let key = BASE64_STANDARD
+        .decode(base64_key)
+        .context("decode CAS AES key")?;
+    if key.len() != 16 {
+        bail!("CAS AES key must decode to 16 bytes, got {}", key.len());
+    }
+    let cipher = Aes128EcbEnc::new_from_slice(&key).context("init AES-128-ECB")?;
+    let mut buf = plaintext.as_bytes().to_vec();
+    let msg_len = buf.len();
+    buf.resize(msg_len + 16, 0);
+    let encrypted = cipher
+        .encrypt_padded_mut::<Pkcs7>(&mut buf, msg_len)
+        .map_err(|err| anyhow::anyhow!("AES padding/encryption failed: {err}"))?;
+    Ok(BASE64_STANDARD.encode(encrypted))
+}
+
+fn write_cookie_file(path: &PathBuf, cookie: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create cookie dir {}", parent.display()))?;
+        set_private_dir_permissions(parent)?;
+    }
+    std::fs::write(path, format!("{}\n", cookie.trim()))
+        .with_context(|| format!("write cookie file {}", path.display()))?;
+    set_private_file_permissions(path)
+}
+
 fn cookie_command(command: CookieCommand) -> Result<()> {
     match command {
         CookieCommand::Import(args) => cookie_import(args),
@@ -521,14 +893,7 @@ fn resolve_cookie_import(args: &CookieImportArgs) -> Result<String> {
 fn cookie_import(args: CookieImportArgs) -> Result<()> {
     let cookie = resolve_cookie_import(&args)?;
     let path = args.output.unwrap_or(default_cookie_path()?);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("create cookie dir {}", parent.display()))?;
-        set_private_dir_permissions(parent)?;
-    }
-    std::fs::write(&path, format!("{}\n", cookie.trim()))
-        .with_context(|| format!("write cookie file {}", path.display()))?;
-    set_private_file_permissions(&path)?;
+    write_cookie_file(&path, &cookie)?;
     println!("cookie_file: {}", path.display());
     println!("cookie: imported ({})", cookie_summary(&cookie));
     print_cookie_warnings(&cookie);
@@ -1257,6 +1622,35 @@ mod tests {
         assert_eq!(
             duplicate_cookie_names("SCOW_USER=old; _ga=a; SCOW_USER=new; _ga=b; scow-dark=x"),
             vec!["SCOW_USER".to_string(), "_ga".to_string()]
+        );
+    }
+
+    #[test]
+    fn parses_cas_login_form() {
+        let html = r#"
+            <form method="post" action="login">
+              <p id="login-croypto">MDEyMzQ1Njc4OWFiY2RlZg==</p>
+              <p id="login-page-flowkey">flow&amp;key</p>
+            </form>
+        "#;
+        let form = parse_cas_login_form(html).unwrap();
+        assert_eq!(form.action, "login");
+        assert_eq!(form.croypto, "MDEyMzQ1Njc4OWFiY2RlZg==");
+        assert_eq!(form.execution, "flow&key");
+    }
+
+    #[test]
+    fn encrypts_like_cryptojs_aes_ecb_pkcs7() {
+        let encrypted =
+            aes_ecb_pkcs7_encrypt_base64("MDEyMzQ1Njc4OWFiY2RlZg==", "password").unwrap();
+        assert_eq!(encrypted, "R4lDIBO/32oRLZSjtsPrGQ==");
+    }
+
+    #[test]
+    fn redacts_login_url_query() {
+        assert_eq!(
+            redact_login_url("https://id.ustc.edu.cn/cas/login?service=secret&state=x"),
+            "https://id.ustc.edu.cn/cas/login"
         );
     }
 

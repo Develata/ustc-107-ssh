@@ -31,7 +31,17 @@ wss://107.ustc.edu.cn/api/shell?cluster=training&loginNode=11.11.10.202&path=&co
 
 The live 107 frontend always includes `useRoot`: `useRoot=false` for normal shell and `useRoot=true` only when explicitly requested and enabled.
 
-The user supplies the browser `Cookie:` header through one of:
+The user can either run headless USTC unified-auth login:
+
+```bash
+ustc-107-ssh login
+# or skip automatic probe after cookie import:
+ustc-107-ssh login --no-verify
+```
+
+`login` prompts for username visibly and password without echo, follows official CAS OAuth, does not save the password, and writes only the resulting 107 cookie material. If CAS requests SMS/phone/OTP/terminal-binding verification, the current slice reports an unsupported extra step; capture the redacted output and extend the verifier flow.
+
+Alternatively, the user supplies the browser `Cookie:` header through one of:
 
 ```bash
 ustc-107-ssh cookie import --cookie-stdin
@@ -101,7 +111,7 @@ Current bridge semantics:
 
 ## Troubleshooting
 
-- `doctor --auth-check` returns `307` to `/auth`: cookie is incomplete or expired; import the complete WebSocket request `Cookie:` header from browser DevTools.
+- `doctor --auth-check` returns `307` to `/auth`: not a sufficient failure proof; use `probe` as the WebShell validity check.
 - `401/403` or policy close: cookie expired; user must log in again.
 - TLS failure: do not disable verification by default; inspect corporate proxy / clock / certificate chain.
 - SSH connects but no prompt output: verify that `probe` or `attach` receives `$case=data` output from 107; WebSocket `HTTP 101` alone only proves the handshake.

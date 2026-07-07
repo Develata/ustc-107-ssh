@@ -20,6 +20,7 @@ local ssh client
 ```bash
 ustc-107-ssh url
 ustc-107-ssh doctor --auth-check
+ustc-107-ssh login
 ustc-107-ssh cookie path
 ustc-107-ssh cookie import --cookie-stdin
 ustc-107-ssh cookie inspect
@@ -33,6 +34,7 @@ ustc-107-ssh print-ssh-config --host ustc107
 
 - `url`：打印指定 cluster / login-node 的准确 WebSocket URL；
 - `doctor`：检查本地前提条件与安全假设，`--auth-check` 会额外请求 `/api/auth` 判断 Cookie 是否被 107 auth 入口接受；
+- `login`：headless 走 USTC 统一身份认证 UsernamePassword flow，成功后导入 107 Cookie；
 - `cookie import/path/inspect`：管理本用户的本地 Cookie 文件，不打印 secret 值；
 - `probe`：使用已有浏览器 Cookie 连接 107 WebSocket，并测试一条命令；
 - `attach`：把本地终端 stdio 接到 107 WebSocket 数据流；
@@ -53,6 +55,28 @@ cargo build --release
 - host key 默认生成到 `~/.config/ustc-107-ssh/host_key`；
 - Cookie 默认读取自 `~/.config/ustc-107-ssh/cookie.txt`；
 - Unix 下 config 目录权限设为 `0700`，secret 文件设为 `0600`。
+
+## Headless SSO login
+
+推荐路径：
+
+```bash
+ustc-107-ssh login
+```
+
+行为 contract：
+
+- 用户名在 CLI 明文提示输入；密码无回显输入；
+- 工具访问 `https://107.ustc.edu.cn/auth/public/ustc/oauth/start`，跟随官方 USTC CAS OAuth redirect；
+- 密码按 CAS 前端协议加密后提交：`AES-128-ECB-PKCS7(Base64(login-croypto), plaintext_password)`；
+- 成功后只把 107 域名所需 Cookie 写入本地 cookie file；不会打印 Cookie 值，也不会保存密码；
+- 默认会自动运行一次 browser-compatible `probe` 验证。若只想导入 Cookie，不做验证：
+
+```bash
+ustc-107-ssh login --no-verify
+```
+
+当前限制：如果 USTC CAS 对本次登录要求短信/电话验证码、OTP、终端绑定等二次验证，CLI 会检测并报出 unsupported extra step；后续需要根据真实触发页面/接口补验证码提交分支。
 
 ## Cookie 输入与导入
 
@@ -258,9 +282,10 @@ ssh -p 3000 127.0.0.1
 - 本地监听默认只绑定 `127.0.0.1`；
 - 如需 LAN 监听，必须显式提供 `--allow-lan`。
 
-MVP 非目标：
+MVP 非目标 / 当前限制：
 
-- 自动 SSO 登录；
+- 保存统一身份认证密码；
+- 自动绕过或代答 MFA / 风控；
 - GUI；
 - 完整 SSH 协议兼容；
 - 绕过 USTC 政策或访问控制。
