@@ -31,7 +31,17 @@ wss://107.ustc.edu.cn/api/shell?cluster=training&loginNode=11.11.10.202&path=&co
 
 The live 107 frontend always includes `useRoot`: `useRoot=false` for normal shell and `useRoot=true` only when explicitly requested and enabled.
 
-The user can either run headless USTC unified-auth login:
+The user can run commands with direct headless USTC unified-auth, without manually copying cookies:
+
+```bash
+ustc-107-ssh probe --sso-login --browser-compatible --pre-read-seconds 8 --read-seconds 12 --command 'echo USTC_107_SSH_PROBE'
+ustc-107-ssh attach --sso-login
+ustc-107-ssh serve --sso-login --listen 127.0.0.1:3000
+```
+
+`--sso-login` reads `USTC_Student_ID` / `USTC_PASSWORD` from env or prompts, performs the official CAS OAuth flow, obtains a temporary 107 `SCOW_USER`, and immediately connects to `/api/shell`; it does not print or save the WebShell cookie. Do not combine `--sso-login` with `--cookie`, `--cookie-file`, or `--cookie-stdin`.
+
+The user can also run standalone headless USTC unified-auth login to import a cookie file:
 
 ```bash
 ustc-107-ssh login
@@ -60,7 +70,13 @@ Prefer copying the complete `Cookie:` header from DevTools Network → `wss://10
 
 ## Probe First
 
-Before assuming bridge availability, run:
+Before assuming bridge availability, run direct SSO probe if `USTC_Student_ID` / `USTC_PASSWORD` are available:
+
+```bash
+ustc-107-ssh probe --sso-login --browser-compatible --pre-read-seconds 8 --read-seconds 12 --command 'echo USTC_107_SSH_PROBE'
+```
+
+For already-imported cookies, run:
 
 ```bash
 ustc-107-ssh doctor --auth-check

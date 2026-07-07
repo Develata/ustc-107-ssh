@@ -169,6 +169,18 @@ struct SessionArgs {
     /// Do not send a browser-like initial resize frame after WebSocket open.
     #[arg(long, default_value_t = false)]
     no_initial_resize: bool,
+
+    /// Obtain the WebShell cookie by running headless USTC unified-auth before connecting.
+    #[arg(long, default_value_t = false)]
+    sso_login: bool,
+
+    /// USTC unified-auth username/student id for --sso-login. Prompts if omitted.
+    #[arg(long, env = "USTC_Student_ID", hide_env_values = true)]
+    sso_username: Option<String>,
+
+    /// USTC unified-auth password for --sso-login. Prefer prompt or USTC_PASSWORD env; not stored.
+    #[arg(long, env = "USTC_PASSWORD", hide_env_values = true)]
+    sso_password: Option<String>,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -395,6 +407,19 @@ fn resolve_cookie(args: &SessionArgs) -> Result<String> {
     Ok(cookie)
 }
 
+async fn resolve_session_cookie(args: &SessionArgs) -> Result<String> {
+    if args.sso_login {
+        let explicit_cookie_sources =
+            args.cookie.is_some() || args.cookie_file.is_some() || args.cookie_stdin;
+        if explicit_cookie_sources {
+            bail!("--sso-login cannot be combined with --cookie, --cookie-file, or --cookie-stdin");
+        }
+        println!("login_step: direct_sso_for_session");
+        return run_headless_sso_login(args.sso_username.clone(), args.sso_password.clone()).await;
+    }
+    resolve_cookie(args)
+}
+
 fn cookie_names(cookie: &str) -> Vec<String> {
     cookie
         .split(';')
@@ -462,7 +487,7 @@ async fn doctor(args: DoctorArgs) -> Result<()> {
     println!("websocket_url: {url}");
     println!("origin: {}", args.session.origin);
     println!("tls_verification: enabled");
-    match resolve_cookie(&args.session) {
+    match resolve_session_cookie(&args.session).await {
         Ok(cookie) => {
             println!("cookie: present ({})", cookie_summary(&cookie));
             print_cookie_warnings(&cookie);
@@ -609,11 +634,52 @@ fn prompt_line(prompt: &str) -> Result<String> {
 }
 
 async fn login(args: LoginArgs) -> Result<()> {
-    let username = match args.username {
+    let cookie = run_headless_sso_login(args.username, args.password).await?;
+
+    let output = args.output.unwrap_or(default_cookie_path()?);
+    write_cookie_file(&output, &cookie)?;
+    println!("cookie_file: {}", output.display());
+    println!("cookie: imported ({})", cookie_summary(&cookie));
+    print_cookie_warnings(&cookie);
+    println!("cookie_hint: {}", cookie_hint(&cookie));
+
+    if !args.no_verify {
+        println!("login_step: verify_probe");
+        let probe_args = ProbeArgs {
+            session: SessionArgs {
+                target: args.target,
+                cookie: Some(cookie),
+                cookie_file: None,
+                cookie_stdin: false,
+                origin: DEFAULT_ORIGIN.to_string(),
+                user_agent: DEFAULT_USER_AGENT.to_string(),
+                insecure_tls: false,
+                no_initial_resize: false,
+                sso_login: false,
+                sso_username: None,
+                sso_password: None,
+            },
+            command: "echo USTC_107_LOGIN_PROBE".to_string(),
+            read_seconds: 12,
+            pre_read_seconds: 8,
+            enter: "cr".to_string(),
+            browser_compatible: true,
+            send_delay_ms: 1000,
+        };
+        probe(probe_args).await?;
+    }
+    Ok(())
+}
+
+async fn run_headless_sso_login(
+    username: Option<String>,
+    password: Option<String>,
+) -> Result<String> {
+    let username = match username {
         Some(value) => value,
         None => prompt_line("USTC username/student id: ")?,
     };
-    let password = match args.password {
+    let password = match password {
         Some(value) => value,
         None => rpassword::prompt_password("USTC password: ")?,
     };
@@ -688,7 +754,7 @@ async fn login(args: LoginArgs) -> Result<()> {
             || body.contains("验证码")
             || body.contains("checkTokenResult")
         {
-            bail!("CAS requested second-factor verification; SMS/phone-code flow is detected but not implemented in this slice");
+            bail!("CAS requested second-factor verification; SMS/phone-code flow is detected but not implemented yet. Run with a browser once or extend the CLI verifier flow from this page shape.");
         }
         if body.contains("用户名/密码") || body.contains("密码错误") || body.contains("无效")
         {
@@ -701,37 +767,7 @@ async fn login(args: LoginArgs) -> Result<()> {
     if cookie.is_empty() || !cookie_names(&cookie).iter().any(|name| name == "SCOW_USER") {
         bail!("login completed without a usable 107 SCOW_USER cookie; USTC CAS may have required an unsupported extra step");
     }
-
-    let output = args.output.unwrap_or(default_cookie_path()?);
-    write_cookie_file(&output, &cookie)?;
-    println!("cookie_file: {}", output.display());
-    println!("cookie: imported ({})", cookie_summary(&cookie));
-    print_cookie_warnings(&cookie);
-    println!("cookie_hint: {}", cookie_hint(&cookie));
-
-    if !args.no_verify {
-        println!("login_step: verify_probe");
-        let probe_args = ProbeArgs {
-            session: SessionArgs {
-                target: args.target,
-                cookie: Some(cookie),
-                cookie_file: None,
-                cookie_stdin: false,
-                origin: DEFAULT_ORIGIN.to_string(),
-                user_agent: DEFAULT_USER_AGENT.to_string(),
-                insecure_tls: false,
-                no_initial_resize: false,
-            },
-            command: "echo USTC_107_LOGIN_PROBE".to_string(),
-            read_seconds: 12,
-            pre_read_seconds: 8,
-            enter: "cr".to_string(),
-            browser_compatible: true,
-            send_delay_ms: 1000,
-        };
-        probe(probe_args).await?;
-    }
-    Ok(())
+    Ok(cookie)
 }
 
 async fn get_until_cas_login(
@@ -926,6 +962,9 @@ fn resolve_cookie_import(args: &CookieImportArgs) -> Result<String> {
         user_agent: DEFAULT_USER_AGENT.to_string(),
         insecure_tls: false,
         no_initial_resize: false,
+        sso_login: false,
+        sso_username: None,
+        sso_password: None,
     };
     resolve_cookie(&session_args)
 }
@@ -992,7 +1031,7 @@ async fn probe(args: ProbeArgs) -> Result<()> {
         send_delay_ms = send_delay_ms.max(1000);
     }
 
-    let cookie = resolve_cookie(&session)?;
+    let cookie = resolve_session_cookie(&session).await?;
     eprintln!("cookie: {}", cookie_summary(&cookie));
     if args.browser_compatible {
         eprintln!(
@@ -1069,7 +1108,7 @@ fn format_probe_command(command: &str, enter: &str) -> Result<String> {
 }
 
 async fn attach(args: SessionArgs) -> Result<()> {
-    let cookie = resolve_cookie(&args)?;
+    let cookie = resolve_session_cookie(&args).await?;
     eprintln!("cookie: {}", cookie_summary(&cookie));
     let mut ws = connect_shell(&args, &cookie).await?;
     send_initial_resize_if_enabled(&mut ws, &args).await?;
@@ -1128,7 +1167,7 @@ async fn attach(args: SessionArgs) -> Result<()> {
 
 async fn serve(args: ServeArgs) -> Result<()> {
     enforce_listen_safety(args.listen, args.allow_lan)?;
-    let cookie = resolve_cookie(&args.session)?;
+    let cookie = resolve_session_cookie(&args.session).await?;
     let host_key_path = args.host_key.clone().unwrap_or(default_host_key_path()?);
     let host_key = load_or_generate_host_key(&host_key_path)?;
 

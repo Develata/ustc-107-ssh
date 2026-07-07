@@ -24,9 +24,9 @@ ustc-107-ssh login
 ustc-107-ssh cookie path
 ustc-107-ssh cookie import --cookie-stdin
 ustc-107-ssh cookie inspect
-ustc-107-ssh probe --browser-compatible
-ustc-107-ssh attach
-ustc-107-ssh serve --listen 127.0.0.1:3000
+ustc-107-ssh probe --sso-login --browser-compatible
+ustc-107-ssh attach --sso-login
+ustc-107-ssh serve --sso-login --listen 127.0.0.1:3000
 ustc-107-ssh print-ssh-config --host ustc107
 ```
 
@@ -36,9 +36,9 @@ ustc-107-ssh print-ssh-config --host ustc107
 - `doctor`：检查本地前提条件与安全假设，`--auth-check` 会额外请求 `/api/auth` 判断 Cookie 是否被 107 auth 入口接受；
 - `login`：headless 走 USTC 统一身份认证 UsernamePassword flow，成功后导入 107 Cookie；
 - `cookie import/path/inspect`：管理本用户的本地 Cookie 文件，不打印 secret 值；
-- `probe`：使用已有浏览器 Cookie 连接 107 WebSocket，并测试一条命令；
-- `attach`：把本地终端 stdio 接到 107 WebSocket 数据流；
-- `serve`：启动本地 SSH server，把 SSH shell channel 转发到 107 WebSocket；
+- `probe`：直接 `--sso-login` 或使用已有浏览器 Cookie 连接 107 WebSocket，并测试一条命令；
+- `attach`：直接 `--sso-login` 或把本地终端 stdio 接到 107 WebSocket 数据流；
+- `serve`：直接 `--sso-login` 或使用 Cookie 启动本地 SSH server，把 SSH shell channel 转发到 107 WebSocket；
 - `print-ssh-config`：打印 OpenSSH 配置片段；
 - `skill`：打印供 AI agent 阅读的简明操作说明。
 
@@ -55,6 +55,27 @@ cargo build --release
 - host key 默认生成到 `~/.config/ustc-107-ssh/host_key`；
 - Cookie 默认读取自 `~/.config/ustc-107-ssh/cookie.txt`；
 - Unix 下 config 目录权限设为 `0700`，secret 文件设为 `0600`。
+
+## Direct SSO connection
+
+如果已经在环境里提供：
+
+```bash
+export USTC_Student_ID='...'
+export USTC_PASSWORD='...'
+```
+
+后续连接不需要手工复制 Cookie，可以直接在会话命令上加 `--sso-login`：
+
+```bash
+ustc-107-ssh probe --sso-login --browser-compatible --pre-read-seconds 8 --read-seconds 12
+ustc-107-ssh attach --sso-login
+ustc-107-ssh serve --sso-login --listen 127.0.0.1:3000
+```
+
+语义：每次命令启动时先走 USTC 统一身份认证，临时拿到 107 WebShell Cookie，然后立即连接 `/api/shell`；不会要求用户先执行 `cookie import`，也不会打印或保存 Cookie。若同时传入 `--sso-login` 与 `--cookie/--cookie-file/--cookie-stdin`，工具会拒绝，因为这两个来源语义互斥。
+
+注意：当前实测 UsernamePassword OAuth flow 可直接获得 107 `SCOW_USER`。如果 CAS 对某次登录触发短信/电话/OTP/终端绑定，CLI 会检测并明确报出 unsupported extra step；验证码自动提交分支仍需要基于真实触发页面补充。
 
 ## Headless SSO login
 
