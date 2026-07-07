@@ -6,7 +6,7 @@ use russh::keys::{self, Algorithm, PrivateKey};
 use russh::server::{self, Msg, Server as _, Session};
 use russh::{Channel, ChannelId};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
@@ -369,6 +369,26 @@ fn cookie_names(cookie: &str) -> Vec<String> {
         .collect()
 }
 
+fn duplicate_cookie_names(cookie: &str) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut duplicates = Vec::new();
+    for name in cookie_names(cookie) {
+        if !seen.insert(name.clone()) && !duplicates.contains(&name) {
+            duplicates.push(name);
+        }
+    }
+    duplicates
+}
+
+fn print_cookie_warnings(cookie: &str) {
+    let duplicates = duplicate_cookie_names(cookie);
+    if !duplicates.is_empty() {
+        println!(
+            "cookie_warning: duplicate_cookie_names names={duplicates:?}; copy exactly one Cookie header from the active WebSocket request"
+        );
+    }
+}
+
 fn cookie_summary(cookie: &str) -> String {
     let names = cookie_names(cookie);
     format!(
@@ -407,6 +427,7 @@ async fn doctor(args: DoctorArgs) -> Result<()> {
     match resolve_cookie(&args.session) {
         Ok(cookie) => {
             println!("cookie: present ({})", cookie_summary(&cookie));
+            print_cookie_warnings(&cookie);
             println!("cookie_hint: {}", cookie_hint(&cookie));
             if args.auth_check {
                 auth_check(&args.session, &cookie).await?;
@@ -442,15 +463,20 @@ async fn auth_check(args: &SessionArgs, cookie: &str) -> Result<()> {
         println!("auth_check_location: {location}");
     }
     let classification = if status.is_redirection() && location.contains("/auth") {
-        "incomplete_or_expired_cookie"
+        "auth_endpoint_redirected_probe_required"
     } else if status.as_u16() == 401 || status.as_u16() == 403 {
-        "rejected_cookie"
+        "auth_endpoint_rejected_cookie_probe_required"
     } else if status.is_success() {
         "accepted_by_auth_endpoint"
     } else {
-        "unknown_auth_status"
+        "unknown_auth_status_probe_required"
     };
     println!("auth_check_classification: {classification}");
+    if status.is_redirection() && location.contains("/auth") {
+        println!(
+            "auth_check_note: /api/auth redirects can still occur for cookies that work with /api/shell; use probe output as the WebShell validity check"
+        );
+    }
     Ok(())
 }
 
@@ -464,6 +490,7 @@ fn cookie_command(command: CookieCommand) -> Result<()> {
         CookieCommand::Inspect(args) => {
             let cookie = resolve_cookie(&args)?;
             println!("cookie: present ({})", cookie_summary(&cookie));
+            print_cookie_warnings(&cookie);
             println!("cookie_hint: {}", cookie_hint(&cookie));
             Ok(())
         }
@@ -504,6 +531,7 @@ fn cookie_import(args: CookieImportArgs) -> Result<()> {
     set_private_file_permissions(&path)?;
     println!("cookie_file: {}", path.display());
     println!("cookie: imported ({})", cookie_summary(&cookie));
+    print_cookie_warnings(&cookie);
     println!("cookie_hint: {}", cookie_hint(&cookie));
     Ok(())
 }
@@ -1222,6 +1250,14 @@ mod tests {
         assert!(summary.contains("SCOW_USER"));
         assert!(summary.contains("scow-dark"));
         assert!(!summary.contains("secret"));
+    }
+
+    #[test]
+    fn detects_duplicate_cookie_names_once() {
+        assert_eq!(
+            duplicate_cookie_names("SCOW_USER=old; _ga=a; SCOW_USER=new; _ga=b; scow-dark=x"),
+            vec!["SCOW_USER".to_string(), "_ga".to_string()]
+        );
     }
 
     #[test]

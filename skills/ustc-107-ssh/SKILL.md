@@ -46,7 +46,7 @@ ustc-107-ssh probe --cookie-stdin
 ustc-107-ssh probe --cookie-file ~/.config/ustc-107-ssh/cookie.txt
 ```
 
-Prefer copying the complete `Cookie:` header from DevTools Network → `wss://107.ustc.edu.cn/api/shell?...` → Request Headers. Do not rely on `document.cookie`; it may omit HttpOnly session cookies.
+Prefer copying the complete `Cookie:` header from DevTools Network → `wss://107.ustc.edu.cn/api/shell?...` → Request Headers. Do not rely on `document.cookie`; it may omit HttpOnly session cookies. Copy exactly one active WebSocket request's Cookie header; if `cookie import` prints `cookie_warning: duplicate_cookie_names`, discard it and recopy a clean single header.
 
 ## Probe First
 
@@ -59,7 +59,7 @@ ustc-107-ssh probe --browser-compatible --pre-read-seconds 8 --read-seconds 12 -
 
 `--browser-compatible` mimics the Electron/browser bridge path: Chrome-like UA, duplicate initial resize frames, LF enter, at least 1s send delay, and a longer read window.
 
-Success means the WebSocket handshake and cookie work. It does not by itself prove that the remote shell returns `$case=data` frames.
+Treat successful `probe` output—remote prompt or command echo/result in `$case=data` frames—as the WebShell validity check. `doctor --auth-check` is only an auxiliary `/api/auth` entrypoint check; a redirect there can still coexist with a working `/api/shell` cookie.
 
 ## Attach Mode
 

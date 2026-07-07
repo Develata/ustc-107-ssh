@@ -97,7 +97,7 @@ Network
   -> Cookie: <复制冒号后的完整值>
 ```
 
-只含 `SCOW_USER`、`scow-dark`、`_ga*` 的 Cookie 可能不足以创建可用 shell；`doctor --auth-check` 会给出 `cookie_hint` 和 `/api/auth` 分类。
+只含 `SCOW_USER`、`scow-dark`、`_ga*` 的 Cookie 也可能足以创建 shell；`doctor --auth-check` 只检查 `/api/auth` 入口形态，不是 WebShell Cookie 的最终有效性判据。若复制了多段 Cookie 导致同名项重复，工具会输出 `cookie_warning: duplicate_cookie_names`，此时应重新从当前活跃的单个 WebSocket 请求复制一条完整 `Cookie:` header。
 
 ## WebSocket URL 形态
 
@@ -144,10 +144,11 @@ websocket_url: wss://107.ustc.edu.cn/api/shell?...&useRoot=false
 cookie: present (3 cookie pair(s), ... names=[...])
 cookie_hint: possibly_incomplete_public_cookies_only
 auth_check_status: 307
-auth_check_classification: incomplete_or_expired_cookie
+auth_check_classification: auth_endpoint_redirected_probe_required
+auth_check_note: /api/auth redirects can still occur for cookies that work with /api/shell; use probe output as the WebShell validity check
 ```
 
-注意：`HTTP 101 Switching Protocols` 只证明 WebSocket 握手成功，不证明远端 shell 已经分配成功。
+注意：`doctor --auth-check` 是辅助诊断；`/api/auth` 的 307 redirect 不足以证明 Cookie 对 WebShell 无效。真正的有效性判据是 `probe` 是否收到远端 `$case=data` prompt/命令输出。`HTTP 101 Switching Protocols` 只证明 WebSocket 握手成功，不证明远端 shell 已经分配成功。
 
 ## Probe
 
