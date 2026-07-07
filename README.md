@@ -66,11 +66,11 @@ ustc-107-ssh login
 
 行为 contract：
 
-- 用户名在 CLI 明文提示输入；密码无回显输入；
+- 用户名在 CLI 明文提示输入；密码无回显输入；也可通过环境变量 `USTC_Student_ID` 与 `USTC_PASSWORD` 提供，便于非交互测试；
 - 工具访问 `https://107.ustc.edu.cn/auth/public/ustc/oauth/start`，跟随官方 USTC CAS OAuth redirect；
-- 密码按 CAS 前端协议加密后提交：`AES-128-ECB-PKCS7(Base64(login-croypto), plaintext_password)`；
-- 成功后只把 107 域名所需 Cookie 写入本地 cookie file；不会打印 Cookie 值，也不会保存密码；
-- 默认会自动运行一次 browser-compatible `probe` 验证。若只想导入 Cookie，不做验证：
+- 密码按 CAS 前端协议加密后提交：`AES-128-ECB-PKCS7(Base64(login-croypto), plaintext_password)`；不会保存明文；
+- 成功后只导出 WebShell 所需的 107 Cookie；不会导出 CAS/中间态 `SESSION`，不会打印 Cookie 值；
+- 默认会自动运行一次 browser-compatible `probe` 验证。当前实测 UsernamePassword OAuth flow 可直接获得 107 `SCOW_USER`；若官方 CAS 未来触发短信/电话/OTP 二次验证，工具会在该额外步骤失败并提示。若只想导入 Cookie，不做验证：
 
 ```bash
 ustc-107-ssh login --no-verify

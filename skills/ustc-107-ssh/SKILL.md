@@ -39,7 +39,7 @@ ustc-107-ssh login
 ustc-107-ssh login --no-verify
 ```
 
-`login` prompts for username visibly and password without echo, follows official CAS OAuth, does not save the password, and writes only the resulting 107 cookie material. If CAS requests SMS/phone/OTP/terminal-binding verification, the current slice reports an unsupported extra step; capture the redacted output and extend the verifier flow.
+`login` prompts for username visibly and password without echo, or reads `USTC_Student_ID` / `USTC_PASSWORD` from env for non-interactive tests. It follows official CAS OAuth, encrypts the password with the CAS AES-128-ECB-PKCS7 scheme, does not save the password, exports only WebShell cookie material, and runs probe unless `--no-verify` is set. Current live flow succeeds with `SCOW_USER`; if CAS later requests SMS/phone/OTP/terminal-binding verification, treat it as an unsupported extra step, capture redacted output, and extend the verifier flow.
 
 Alternatively, the user supplies the browser `Cookie:` header through one of:
 

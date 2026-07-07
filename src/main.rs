@@ -143,7 +143,7 @@ struct SessionArgs {
     target: TargetArgs,
 
     /// Cookie header value. Prefer env/file/stdin over shell history.
-    #[arg(long, env = ENV_COOKIE, hide_env_values = true)]
+    #[arg(long, hide_env_values = true)]
     cookie: Option<String>,
 
     /// Read cookie header value from file.
@@ -197,11 +197,11 @@ struct LoginArgs {
     target: TargetArgs,
 
     /// USTC unified-auth username/student id. Prompts if omitted.
-    #[arg(long)]
+    #[arg(long, env = "USTC_Student_ID")]
     username: Option<String>,
 
-    /// USTC unified-auth password. Prefer prompt; env/CLI use is intentionally not provided.
-    #[arg(long, hide = true)]
+    /// USTC unified-auth password. Prefer prompt or USTC_PASSWORD env; not stored.
+    #[arg(long, env = "USTC_PASSWORD", hide_env_values = true)]
     password: Option<String>,
 
     /// Destination cookie file. Defaults to ~/.config/ustc-107-ssh/cookie.txt.
@@ -362,6 +362,7 @@ fn resolve_cookie(args: &SessionArgs) -> Result<String> {
     sources += usize::from(args.cookie.is_some());
     sources += usize::from(args.cookie_file.is_some());
     sources += usize::from(args.cookie_stdin);
+    let env_cookie = std::env::var(ENV_COOKIE).ok();
     if sources > 1 {
         bail!(
             "provide at most one cookie source: --cookie, --cookie-file, --cookie-stdin, or env {ENV_COOKIE}"
@@ -375,6 +376,8 @@ fn resolve_cookie(args: &SessionArgs) -> Result<String> {
             .with_context(|| format!("read cookie file {}", path.display()))?
     } else if args.cookie_stdin {
         rpassword::prompt_password("Cookie header: ")?
+    } else if let Some(value) = env_cookie {
+        value
     } else {
         let path = default_cookie_path()?;
         std::fs::read_to_string(&path).with_context(|| {
@@ -527,10 +530,16 @@ struct CasLoginForm {
 #[derive(Debug, Default, Clone)]
 struct SimpleCookieJar {
     values: HashMap<String, String>,
+    host_values: HashMap<String, HashMap<String, String>>,
 }
 
 impl SimpleCookieJar {
     fn store_from_response(&mut self, response: &reqwest::Response) {
+        let host = response
+            .url()
+            .host_str()
+            .map(ToOwned::to_owned)
+            .unwrap_or_default();
         for value in response.headers().get_all(SET_COOKIE.as_str()) {
             let Ok(text) = value.to_str() else {
                 continue;
@@ -543,16 +552,40 @@ impl SimpleCookieJar {
             if !name.is_empty() {
                 self.values
                     .insert(name.to_string(), value.trim().to_string());
+                self.host_values
+                    .entry(host.clone())
+                    .or_default()
+                    .insert(name.to_string(), value.trim().to_string());
             }
         }
     }
 
     fn header_for_host(&self, host: &str) -> String {
-        let mut items: Vec<_> = self.values.iter().collect();
+        let mut items: Vec<_> = self
+            .host_values
+            .get(host)
+            .unwrap_or(&self.values)
+            .iter()
+            .collect();
         items.sort_by(|a, b| a.0.cmp(b.0));
         items
             .into_iter()
-            .filter(|(name, _)| host != USTC_107_HOST || is_107_cookie_name(name))
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+
+    fn export_for_107(&self) -> String {
+        let mut items: Vec<_> = self
+            .host_values
+            .get(USTC_107_HOST)
+            .unwrap_or(&self.values)
+            .iter()
+            .filter(|(name, _)| is_107_cookie_name(name))
+            .collect();
+        items.sort_by(|a, b| a.0.cmp(b.0));
+        items
+            .into_iter()
             .map(|(name, value)| format!("{name}={value}"))
             .collect::<Vec<_>>()
             .join("; ")
@@ -561,6 +594,10 @@ impl SimpleCookieJar {
 
 fn is_107_cookie_name(name: &str) -> bool {
     name == "SCOW_USER" || name == "scow-dark" || name.starts_with("_ga")
+}
+
+fn has_107_scow_cookie(jar: &SimpleCookieJar) -> bool {
+    jar.values.contains_key("SCOW_USER")
 }
 
 fn prompt_line(prompt: &str) -> Result<String> {
@@ -643,6 +680,9 @@ async fn login(args: LoginArgs) -> Result<()> {
         }
 
         let body = response.text().await.context("read login response body")?;
+        if has_107_scow_cookie(&jar) {
+            break;
+        }
         if body.contains("动态口令")
             || body.contains("短信")
             || body.contains("验证码")
@@ -657,7 +697,7 @@ async fn login(args: LoginArgs) -> Result<()> {
         break;
     }
 
-    let cookie = jar.header_for_host(USTC_107_HOST);
+    let cookie = jar.export_for_107();
     if cookie.is_empty() || !cookie_names(&cookie).iter().any(|name| name == "SCOW_USER") {
         bail!("login completed without a usable 107 SCOW_USER cookie; USTC CAS may have required an unsupported extra step");
     }
