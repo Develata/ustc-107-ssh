@@ -1,0 +1,98 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.asset_suffix }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            asset_suffix: linux-x86_64
+            archive: tar.gz
+          - os: windows-latest
+            asset_suffix: windows-x86_64
+            archive: zip
+          - os: macos-13
+            asset_suffix: macos-x86_64
+            archive: tar.gz
+          - os: macos-14
+            asset_suffix: macos-arm64
+            archive: tar.gz
+    runs-on: ${{ matrix.os }}
+    env:
+      ASSET_SUFFIX: ${{ matrix.asset_suffix }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Package Unix asset
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          asset="ustc-107-ssh-${tag}-${ASSET_SUFFIX}"
+          mkdir -p "dist/${asset}"
+          cp target/release/ustc-107-ssh "dist/${asset}/"
+          cp README.md "dist/${asset}/"
+          tar -C dist -czf "dist/${asset}.tar.gz" "${asset}"
+          (cd dist && shasum -a 256 "${asset}.tar.gz" > "${asset}.tar.gz.sha256")
+
+      - name: Package Windows asset
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = $env:GITHUB_REF_NAME
+          $asset = "ustc-107-ssh-$tag-$env:ASSET_SUFFIX"
+          New-Item -ItemType Directory -Force -Path "dist/$asset" | Out-Null
+          Copy-Item "target/release/ustc-107-ssh.exe" "dist/$asset/"
+          Copy-Item "README.md" "dist/$asset/"
+          Compress-Archive -Path "dist/$asset" -DestinationPath "dist/$asset.zip" -Force
+          $hash = (Get-FileHash "dist/$asset.zip" -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $asset.zip" | Out-File -Encoding ascii "dist/$asset.zip.sha256"
+
+      - name: Upload packaged asset
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.asset_suffix }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.sha256
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download packaged assets
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List assets
+        run: find dist -maxdepth 1 -type f -print | sort
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

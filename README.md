@@ -44,6 +44,16 @@ ustc-107-ssh print-ssh-config --host ustc107
 
 ## 安装 / 构建
 
+发布版本会随 `v*` tag 自动生成 GitHub Release 资产：
+
+- `ustc-107-ssh-vX.Y.Z-linux-x86_64.tar.gz`
+- `ustc-107-ssh-vX.Y.Z-windows-x86_64.zip`
+- `ustc-107-ssh-vX.Y.Z-macos-x86_64.tar.gz`
+- `ustc-107-ssh-vX.Y.Z-macos-arm64.tar.gz`
+- 每个资产都有同名 `.sha256` 校验文件。
+
+源码构建：
+
 ```bash
 cargo build --release
 ./target/release/ustc-107-ssh --help
@@ -75,7 +85,7 @@ ustc-107-ssh serve --sso-login --listen 127.0.0.1:3000
 
 语义：每次命令启动时先走 USTC 统一身份认证，临时拿到 107 WebShell Cookie，然后立即连接 `/api/shell`；不会要求用户先执行 `cookie import`，也不会打印或保存 Cookie。若同时传入 `--sso-login` 与 `--cookie/--cookie-file/--cookie-stdin`，工具会拒绝，因为这两个来源语义互斥。
 
-注意：当前实测 UsernamePassword OAuth flow 可直接获得 107 `SCOW_USER`。如果 CAS 对某次登录触发短信/电话/OTP/终端绑定，CLI 会检测并明确报出 unsupported extra step；验证码自动提交分支仍需要基于真实触发页面补充。
+注意：`--sso-login` 只表示“不手工传 Cookie，直接走统一身份认证”，不表示 CAS 永远不会要求二次验证。当前在 Hermes 环境与 Develata 本地 Windows 手动验证时，UsernamePassword OAuth flow 均未触发短信/电话/OTP，直接获得 107 `SCOW_USER`；但 Develata 实际使用中很多场景会触发二次验证。若 CAS 对某次登录触发短信/电话/OTP/终端绑定，CLI 会检测并明确报出 unsupported extra step；验证码自动提交分支仍需要基于真实触发页面补充。
 
 ## Headless SSO login
 
@@ -91,7 +101,7 @@ ustc-107-ssh login
 - 工具访问 `https://107.ustc.edu.cn/auth/public/ustc/oauth/start`，跟随官方 USTC CAS OAuth redirect；
 - 密码按 CAS 前端协议加密后提交：`AES-128-ECB-PKCS7(Base64(login-croypto), plaintext_password)`；不会保存明文；
 - 成功后只导出 WebShell 所需的 107 Cookie；不会导出 CAS/中间态 `SESSION`，不会打印 Cookie 值；
-- 默认会自动运行一次 browser-compatible `probe` 验证。当前实测 UsernamePassword OAuth flow 可直接获得 107 `SCOW_USER`；若官方 CAS 未来触发短信/电话/OTP 二次验证，工具会在该额外步骤失败并提示。若只想导入 Cookie，不做验证：
+- 默认会自动运行一次 browser-compatible `probe` 验证。当前 Hermes 环境与 Develata 本地 Windows 手动验证未触发二次验证，UsernamePassword OAuth flow 可直接获得 107 `SCOW_USER`；但实际使用中很多场景可能触发短信/电话/OTP，工具会在该额外步骤失败并提示。若只想导入 Cookie，不做验证：
 
 ```bash
 ustc-107-ssh login --no-verify
