@@ -4,7 +4,7 @@ Use this skill when an AI agent needs terminal access to the USTC 107 Web Shell 
 
 ## Status
 
-This project has a Rust CLI protocol probe / attach tool and a localhost SSH bridge MVP. The bridge is a compatibility layer over SCOW WebShell, not a real remote `sshd`.
+This project has a Rust CLI protocol probe / attach tool, a localhost SSH bridge MVP, and a minimal Dashboard file API client (`files ls/get/put/mkdir/rm`). The bridge is a compatibility layer over SCOW WebShell, not a real remote `sshd`; file transfer uses `/api/file/*`, not SFTP.
 
 ## Safety Rules
 
@@ -40,6 +40,28 @@ ustc-107-ssh serve --sso-login --listen 127.0.0.1:3000
 ```
 
 `--sso-login` reads `USTC_Student_ID` / `USTC_PASSWORD` from env or prompts, performs the official CAS OAuth flow, obtains a temporary 107 `SCOW_USER`, and immediately connects to `/api/shell`; it does not print or save the WebShell cookie. Do not combine `--sso-login` with `--cookie`, `--cookie-file`, or `--cookie-stdin`.
+
+## Dashboard File Transfer
+
+Use direct SSO for dashboard file APIs when possible:
+
+```bash
+ustc-107-ssh files --sso-login ls /home/scc/pb22010333
+ustc-107-ssh files --sso-login get /home/scc/pb22010333/remote.txt ./remote.txt
+ustc-107-ssh files --sso-login put ./local.txt /home/scc/pb22010333/local.txt
+ustc-107-ssh files --sso-login mkdir /home/scc/pb22010333/tmp-dir
+ustc-107-ssh files --sso-login rm /home/scc/pb22010333/file.txt
+ustc-107-ssh files --sso-login rm --dir /home/scc/pb22010333/tmp-dir
+```
+
+API grounding from the Next.js dashboard:
+
+- `GET /api/file/list?cluster=training&path=...` returns `{items:[{name,type,mtime,mode,size}]}`.
+- `GET /api/file/download?cluster=training&path=...&download=true` downloads a file.
+- `POST /api/file/upload?cluster=training&path=...&chunk=false&originPath=` with multipart field `file` uploads a small/normal file.
+- `POST /api/file/mkdir`, `DELETE /api/file/deleteFile`, and `DELETE /api/file/deleteDir` handle basic mutation.
+
+Known boundary: this is not full SFTP. Recursive sync, large-file multipart/chunk resume, permission preservation, symlink semantics, and `scp/sftp` protocol compatibility remain future work. This matches the 107 docs stance: the current platform mainline is Web GUI, file manager, login-cluster Shell, and Slurm jobs; do not assume native SSH unless the platform page/course notice explicitly provides it. For large directories, docs recommend tarball upload and size/sha256 verification.
 
 The user can also run standalone headless USTC unified-auth login to import a cookie file:
 

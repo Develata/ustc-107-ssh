@@ -2,7 +2,7 @@
 
 `ustc-107-ssh` 是一个 Rust CLI 工具，目标是把中国科学技术大学 107 平台的 Web Shell 接入本地终端与本地 OpenSSH 工作流。
 
-当前状态：**WebShell → localhost SSH bridge MVP**。
+当前状态：**WebShell bridge MVP + Dashboard files API MVP**。
 
 它已经提供本地 SSH server 外壳，把 OpenSSH client 的 shell channel 转发到 107 WebShell WebSocket；但它不是远端真实 `sshd`，`exec`/`scp`/端口转发等 SSH 语义仍是非目标或 best-effort。
 
@@ -27,6 +27,9 @@ ustc-107-ssh cookie inspect
 ustc-107-ssh probe --sso-login --browser-compatible
 ustc-107-ssh attach --sso-login
 ustc-107-ssh serve --sso-login --listen 127.0.0.1:3000
+ustc-107-ssh files --sso-login ls /home/scc/pb22010333
+ustc-107-ssh files --sso-login get /home/scc/pb22010333/remote.txt ./remote.txt
+ustc-107-ssh files --sso-login put ./local.txt /home/scc/pb22010333/local.txt
 ustc-107-ssh print-ssh-config --host ustc107
 ```
 
@@ -39,6 +42,7 @@ ustc-107-ssh print-ssh-config --host ustc107
 - `probe`：直接 `--sso-login` 或使用已有浏览器 Cookie 连接 107 WebSocket，并测试一条命令；
 - `attach`：直接 `--sso-login` 或把本地终端 stdio 接到 107 WebSocket 数据流；
 - `serve`：直接 `--sso-login` 或使用 Cookie 启动本地 SSH server，把 SSH shell channel 转发到 107 WebSocket；
+- `files ls/get/put/mkdir/rm`：直接 `--sso-login` 或使用 Cookie 调用 107 Dashboard `/api/file/*`，提供最小上传/下载/列目录能力；
 - `print-ssh-config`：打印 OpenSSH 配置片段；
 - `skill`：打印供 AI agent 阅读的简明操作说明。
 
@@ -86,6 +90,44 @@ ustc-107-ssh serve --sso-login --listen 127.0.0.1:3000
 语义：每次命令启动时先走 USTC 统一身份认证，临时拿到 107 WebShell Cookie，然后立即连接 `/api/shell`；不会要求用户先执行 `cookie import`，也不会打印或保存 Cookie。若同时传入 `--sso-login` 与 `--cookie/--cookie-file/--cookie-stdin`，工具会拒绝，因为这两个来源语义互斥。
 
 注意：`--sso-login` 只表示“不手工传 Cookie，直接走统一身份认证”，不表示 CAS 永远不会要求二次验证。当前在 Hermes 环境与 Develata 本地 Windows 手动验证时，UsernamePassword OAuth flow 均未触发短信/电话/OTP，直接获得 107 `SCOW_USER`；但 Develata 实际使用中很多场景会触发二次验证。若 CAS 对某次登录触发短信/电话/OTP/终端绑定，CLI 会检测并明确报出 unsupported extra step；验证码自动提交分支仍需要基于真实触发页面补充。
+
+## Dashboard file transfer
+
+107 的网页文件管理页面：
+
+```text
+https://107.ustc.edu.cn/files/training/home/scc/pb22010333
+```
+
+背后使用的是 Dashboard 文件 API，而不是 SSH/SFTP。107 官方帮助页也说明：当前平台主线流程以 Web GUI、文件管理、登录集群 Shell 和 Slurm 作业为准；如果页面或课程通知没有提供 SSH 入口，不要假设可以直接用本地 `ssh` 登录。文件传输方面，官方建议优先使用 GUI 文件管理；大目录先本地打包后上传，上传后用文件大小或 `sha256sum` 校验完整性。
+
+因此 CLI 暴露的是一个最小 Dashboard 文件 API 转接层，而不是完整 SFTP server：
+
+```bash
+# 默认 cluster=training；不传 path 时 ls 会读取 dashboard home
+ustc-107-ssh files --sso-login ls
+ustc-107-ssh files --sso-login ls /home/scc/pb22010333
+
+# 下载 / 上传单个文件
+ustc-107-ssh files --sso-login get /home/scc/pb22010333/remote.txt ./remote.txt
+ustc-107-ssh files --sso-login put ./local.txt /home/scc/pb22010333/local.txt
+
+# 目录和删除
+ustc-107-ssh files --sso-login mkdir /home/scc/pb22010333/tmp-dir
+ustc-107-ssh files --sso-login rm /home/scc/pb22010333/file.txt
+ustc-107-ssh files --sso-login rm --dir /home/scc/pb22010333/tmp-dir
+```
+
+实现 contract：
+
+- `files` 命令每次先通过 `--sso-login` 走统一身份认证，临时拿到 Dashboard Cookie；不打印或保存 Cookie；
+- `ls` 调用 `GET /api/file/list`；
+- `get` 调用 `GET /api/file/download`；
+- `put` 调用 `POST /api/file/upload` 的单请求上传路径；
+- `mkdir` / `rm` 调用对应的 `/api/file/mkdir`、`deleteFile`、`deleteDir`；
+- 这不是完整 SFTP server：递归目录同步、大文件 multipart/chunk resume、权限保留、软链接语义、scp/sftp protocol 兼容暂未实现。
+
+已验证的最小 smoke：`ls home -> mkdir .cache/tmp -> put small file -> get same file -> rm file -> rm --dir tmp`。
 
 ## Headless SSO login
 

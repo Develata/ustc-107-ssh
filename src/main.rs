@@ -10,6 +10,7 @@ use reqwest::header::{CONTENT_TYPE, REFERER};
 use russh::keys::{self, Algorithm, PrivateKey};
 use russh::server::{self, Msg, Server as _, Session};
 use russh::{Channel, ChannelId};
+use serde::Deserialize;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
@@ -104,6 +105,8 @@ enum Command {
     Attach(SessionArgs),
     /// Run a localhost SSH server that bridges shell channels to 107 WebShell.
     Serve(ServeArgs),
+    /// Use the 107 dashboard file APIs for ls/get/put/rm/mkdir.
+    Files(FilesArgs),
     /// Print an OpenSSH config snippet for the local bridge.
     PrintSshConfig(PrintSshConfigArgs),
     /// Print compact agent-facing instructions.
@@ -293,6 +296,90 @@ struct ServeArgs {
 }
 
 #[derive(Debug, Args, Clone)]
+struct FilesArgs {
+    #[command(flatten)]
+    auth: FileAuthArgs,
+
+    #[command(subcommand)]
+    command: FilesCommand,
+}
+
+#[derive(Debug, Args, Clone)]
+struct FileAuthArgs {
+    /// SCOW cluster name used by the dashboard file API.
+    #[arg(long, default_value = DEFAULT_CLUSTER, global = true)]
+    cluster: String,
+
+    /// Cookie header value. Prefer --sso-login when possible.
+    #[arg(long, hide_env_values = true, global = true)]
+    cookie: Option<String>,
+
+    /// Read cookie header value from file.
+    #[arg(long, global = true)]
+    cookie_file: Option<PathBuf>,
+
+    /// Prompt for cookie header value on stdin without echo.
+    #[arg(long, global = true)]
+    cookie_stdin: bool,
+
+    /// Obtain the dashboard cookie by running headless USTC unified-auth before the file operation.
+    #[arg(long, default_value_t = false, global = true)]
+    sso_login: bool,
+
+    /// USTC unified-auth username/student id for --sso-login. Prompts if omitted.
+    #[arg(long, env = "USTC_Student_ID", hide_env_values = true, global = true)]
+    sso_username: Option<String>,
+
+    /// USTC unified-auth password for --sso-login. Prefer prompt or USTC_PASSWORD env; not stored.
+    #[arg(long, env = "USTC_PASSWORD", hide_env_values = true, global = true)]
+    sso_password: Option<String>,
+}
+
+#[derive(Debug, Subcommand, Clone)]
+enum FilesCommand {
+    /// List a remote dashboard directory.
+    Ls {
+        /// Remote path. Defaults to the dashboard home directory.
+        path: Option<String>,
+    },
+    /// Download a remote file.
+    Get {
+        remote: String,
+        local: Option<PathBuf>,
+    },
+    /// Upload a local file to a remote file path.
+    Put { local: PathBuf, remote: String },
+    /// Create a remote directory.
+    Mkdir { remote: String },
+    /// Remove a remote file, or a directory with --dir.
+    Rm {
+        remote: String,
+        #[arg(long, default_value_t = false)]
+        dir: bool,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+struct FileListResponse {
+    items: Vec<FileEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FileEntry {
+    name: String,
+    #[serde(rename = "type")]
+    kind: String,
+    mtime: Option<String>,
+    mode: Option<u64>,
+    size: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HomeResponse {
+    path: String,
+}
+
+#[derive(Debug, Args, Clone)]
 struct PrintSshConfigArgs {
     /// Host alias to print.
     #[arg(long, default_value = "ustc107")]
@@ -340,6 +427,7 @@ async fn main() -> Result<()> {
         Command::Probe(args) => probe(args).await?,
         Command::Attach(args) => attach(args).await?,
         Command::Serve(args) => serve(args).await?,
+        Command::Files(args) => files(args).await?,
         Command::PrintSshConfig(args) => print_ssh_config(args),
         Command::Skill => print_skill(),
     }
@@ -541,6 +629,317 @@ async fn auth_check(args: &SessionArgs, cookie: &str) -> Result<()> {
         );
     }
     Ok(())
+}
+
+async fn files(args: FilesArgs) -> Result<()> {
+    let cookie = resolve_file_cookie(&args.auth).await?;
+    let api = FileApi::new(args.auth.cluster.clone(), cookie)?;
+
+    match args.command {
+        FilesCommand::Ls { path } => {
+            let path = match path {
+                Some(path) => path,
+                None => api.home().await?,
+            };
+            let entries = api.list(&path).await?;
+            println!("path: {path}");
+            println!(
+                "{:<4} {:>12} {:>5} {:<25} name",
+                "type", "size", "mode", "mtime"
+            );
+            for entry in entries {
+                let mode = entry
+                    .mode
+                    .map(|mode| format!("{:o}", mode & 0o777))
+                    .unwrap_or_else(|| "-".to_string());
+                println!(
+                    "{:<4} {:>12} {:>5} {:<25} {}",
+                    entry.kind,
+                    entry
+                        .size
+                        .map(|size| size.to_string())
+                        .unwrap_or_else(|| "-".to_string()),
+                    mode,
+                    entry.mtime.unwrap_or_else(|| "-".to_string()),
+                    entry.name
+                );
+            }
+        }
+        FilesCommand::Get { remote, local } => {
+            let bytes = api.download(&remote).await?;
+            let local = resolve_download_path(&remote, local)?;
+            if let Some(parent) = local
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+            {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("create local directory {}", parent.display()))?;
+            }
+            std::fs::write(&local, &bytes)
+                .with_context(|| format!("write local file {}", local.display()))?;
+            println!(
+                "downloaded: {} -> {} ({} byte(s))",
+                remote,
+                local.display(),
+                bytes.len()
+            );
+        }
+        FilesCommand::Put { local, remote } => {
+            let size = api.upload(&local, &remote).await?;
+            println!(
+                "uploaded: {} -> {} ({} byte(s))",
+                local.display(),
+                remote,
+                size
+            );
+        }
+        FilesCommand::Mkdir { remote } => {
+            api.mkdir(&remote).await?;
+            println!("mkdir: {remote}");
+        }
+        FilesCommand::Rm { remote, dir } => {
+            api.remove(&remote, dir).await?;
+            println!("removed: {remote}");
+        }
+    }
+    Ok(())
+}
+
+async fn resolve_file_cookie(args: &FileAuthArgs) -> Result<String> {
+    if args.sso_login {
+        let explicit_cookie_sources =
+            args.cookie.is_some() || args.cookie_file.is_some() || args.cookie_stdin;
+        if explicit_cookie_sources {
+            bail!("--sso-login cannot be combined with --cookie, --cookie-file, or --cookie-stdin");
+        }
+        println!("login_step: direct_sso_for_files");
+        return run_headless_sso_login(args.sso_username.clone(), args.sso_password.clone()).await;
+    }
+
+    let session = SessionArgs {
+        target: TargetArgs {
+            cluster: args.cluster.clone(),
+            login_node: DEFAULT_LOGIN_NODE.to_string(),
+            path: String::new(),
+            cols: DEFAULT_COLS,
+            rows: DEFAULT_ROWS,
+            use_root: false,
+        },
+        cookie: args.cookie.clone(),
+        cookie_file: args.cookie_file.clone(),
+        cookie_stdin: args.cookie_stdin,
+        origin: DEFAULT_ORIGIN.to_string(),
+        user_agent: DEFAULT_USER_AGENT.to_string(),
+        insecure_tls: false,
+        no_initial_resize: false,
+        sso_login: false,
+        sso_username: None,
+        sso_password: None,
+    };
+    resolve_cookie(&session)
+}
+
+struct FileApi {
+    cluster: String,
+    cookie: String,
+    client: reqwest::Client,
+}
+
+impl FileApi {
+    fn new(cluster: String, cookie: String) -> Result<Self> {
+        let client = reqwest::Client::builder()
+            .user_agent(BROWSER_USER_AGENT)
+            .build()
+            .context("build dashboard file HTTP client")?;
+        Ok(Self {
+            cluster,
+            cookie,
+            client,
+        })
+    }
+
+    async fn home(&self) -> Result<String> {
+        let value: HomeResponse = self
+            .get_json("getHome", &[("cluster", self.cluster.as_str())])
+            .await?;
+        Ok(value.path)
+    }
+
+    async fn list(&self, path: &str) -> Result<Vec<FileEntry>> {
+        let value: FileListResponse = self
+            .get_json(
+                "list",
+                &[("cluster", self.cluster.as_str()), ("path", path)],
+            )
+            .await?;
+        Ok(value.items)
+    }
+
+    async fn download(&self, path: &str) -> Result<Vec<u8>> {
+        let response = self
+            .client
+            .get(file_api_url("download")?)
+            .header(reqwest::header::COOKIE, &self.cookie)
+            .query(&[
+                ("cluster", self.cluster.as_str()),
+                ("path", path),
+                ("download", "true"),
+            ])
+            .send()
+            .await
+            .with_context(|| format!("GET /api/file/download path={path}"))?;
+        let status = response.status();
+        let bytes = response.bytes().await.context("read download response")?;
+        if !status.is_success() {
+            bail!(
+                "download failed: HTTP {}: {}",
+                status.as_u16(),
+                response_body_snippet(&bytes)
+            );
+        }
+        Ok(bytes.to_vec())
+    }
+
+    async fn upload(&self, local: &PathBuf, remote: &str) -> Result<u64> {
+        let bytes =
+            std::fs::read(local).with_context(|| format!("read local file {}", local.display()))?;
+        let filename = local
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("file")
+            .to_string();
+        let size = bytes.len() as u64;
+        let part = reqwest::multipart::Part::bytes(bytes).file_name(filename);
+        let form = reqwest::multipart::Form::new().part("file", part);
+        let response = self
+            .client
+            .post(file_api_url("upload")?)
+            .header(reqwest::header::COOKIE, &self.cookie)
+            .query(&[
+                ("cluster", self.cluster.as_str()),
+                ("path", remote),
+                ("chunk", "false"),
+                ("originPath", ""),
+            ])
+            .multipart(form)
+            .send()
+            .await
+            .with_context(|| format!("POST /api/file/upload path={remote}"))?;
+        ensure_empty_success(response, "upload").await?;
+        Ok(size)
+    }
+
+    async fn mkdir(&self, path: &str) -> Result<()> {
+        let body = serde_json::json!({ "cluster": self.cluster, "path": path });
+        let response = self
+            .client
+            .post(file_api_url("mkdir")?)
+            .header(reqwest::header::COOKIE, &self.cookie)
+            .json(&body)
+            .send()
+            .await
+            .with_context(|| format!("POST /api/file/mkdir path={path}"))?;
+        ensure_empty_success(response, "mkdir").await
+    }
+
+    async fn remove(&self, path: &str, dir: bool) -> Result<()> {
+        let endpoint = if dir { "deleteDir" } else { "deleteFile" };
+        let response = self
+            .client
+            .delete(file_api_url(endpoint)?)
+            .header(reqwest::header::COOKIE, &self.cookie)
+            .query(&[("cluster", self.cluster.as_str()), ("path", path)])
+            .send()
+            .await
+            .with_context(|| format!("DELETE /api/file/{endpoint} path={path}"))?;
+        ensure_empty_success(response, endpoint).await
+    }
+
+    async fn get_json<T: serde::de::DeserializeOwned>(
+        &self,
+        endpoint: &str,
+        query: &[(&str, &str)],
+    ) -> Result<T> {
+        let response = self
+            .client
+            .get(file_api_url(endpoint)?)
+            .header(reqwest::header::COOKIE, &self.cookie)
+            .query(query)
+            .send()
+            .await
+            .with_context(|| format!("GET /api/file/{endpoint}"))?;
+        let status = response.status();
+        let bytes = response.bytes().await.context("read JSON response")?;
+        if !status.is_success() {
+            bail!(
+                "file API {endpoint} failed: HTTP {}: {}",
+                status.as_u16(),
+                response_body_snippet(&bytes)
+            );
+        }
+        serde_json::from_slice(&bytes).with_context(|| {
+            format!(
+                "parse /api/file/{endpoint} JSON: {}",
+                response_body_snippet(&bytes)
+            )
+        })
+    }
+}
+
+async fn ensure_empty_success(response: reqwest::Response, action: &str) -> Result<()> {
+    let status = response.status();
+    let bytes = response
+        .bytes()
+        .await
+        .with_context(|| format!("read {action} response"))?;
+    if !status.is_success() {
+        bail!(
+            "{action} failed: HTTP {}: {}",
+            status.as_u16(),
+            response_body_snippet(&bytes)
+        );
+    }
+    Ok(())
+}
+
+fn file_api_url(endpoint: &str) -> Result<Url> {
+    Url::parse(&format!("https://107.ustc.edu.cn/api/file/{endpoint}"))
+        .with_context(|| format!("build file API URL for {endpoint}"))
+}
+
+fn response_body_snippet(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    let mut snippet: String = text.chars().take(500).collect();
+    snippet = snippet.replace(['\r', '\n'], " ");
+    if snippet.is_empty() {
+        "<empty>".to_string()
+    } else {
+        snippet
+    }
+}
+
+fn resolve_download_path(remote: &str, local: Option<PathBuf>) -> Result<PathBuf> {
+    if let Some(path) = local {
+        if path.is_dir() {
+            return Ok(path.join(remote_basename(remote)?));
+        }
+        return Ok(path);
+    }
+    Ok(PathBuf::from(remote_basename(remote)?))
+}
+
+fn remote_basename(remote: &str) -> Result<String> {
+    let name = remote
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or("");
+    if name.is_empty() {
+        bail!(
+            "cannot infer local filename from remote path {remote:?}; pass an explicit local path"
+        );
+    }
+    Ok(name.to_string())
 }
 
 type Aes128EcbEnc = Encryptor<Aes128>;
