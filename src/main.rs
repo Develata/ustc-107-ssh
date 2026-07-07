@@ -119,6 +119,10 @@ struct ProbeArgs {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .map_err(|_| anyhow::anyhow!("failed to install rustls ring crypto provider"))?;
+
     let cli = Cli::parse();
     init_tracing(cli.verbose);
 
