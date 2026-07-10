@@ -55,6 +55,7 @@ ustc-107-ssh print-ssh-config --host ustc107
 - `ustc-107-ssh-vX.Y.Z-macos-x86_64.tar.gz`
 - `ustc-107-ssh-vX.Y.Z-macos-arm64.tar.gz`
 - 每个资产都有同名 `.sha256` 校验文件。
+- 每个压缩包都包含可执行文件、`README.md` 与完整 `LICENSE` 文本。
 
 源码构建：
 

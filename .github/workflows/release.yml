@@ -37,6 +37,17 @@ jobs:
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Verify tag matches crate version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(python -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')"
+          expected_tag="v${version}"
+          if [[ "${GITHUB_REF_NAME}" != "${expected_tag}" ]]; then
+            echo "tag/version mismatch: tag=${GITHUB_REF_NAME} expected=${expected_tag}" >&2
+            exit 1
+          fi
+
       - name: Build release binary
         run: cargo build --release --locked
 
@@ -50,8 +61,13 @@ jobs:
           mkdir -p "dist/${asset}"
           cp target/release/ustc-107-ssh "dist/${asset}/"
           cp README.md "dist/${asset}/"
+          cp LICENSE "dist/${asset}/"
           tar -C dist -czf "dist/${asset}.tar.gz" "${asset}"
           (cd dist && shasum -a 256 "${asset}.tar.gz" > "${asset}.tar.gz.sha256")
+          (cd dist && shasum -a 256 -c "${asset}.tar.gz.sha256")
+          tar -tzf "dist/${asset}.tar.gz" | grep -Fx "${asset}/ustc-107-ssh"
+          tar -tzf "dist/${asset}.tar.gz" | grep -Fx "${asset}/README.md"
+          tar -tzf "dist/${asset}.tar.gz" | grep -Fx "${asset}/LICENSE"
 
       - name: Package Windows asset
         if: matrix.archive == 'zip'
@@ -63,9 +79,18 @@ jobs:
           New-Item -ItemType Directory -Force -Path "dist/$asset" | Out-Null
           Copy-Item "target/release/ustc-107-ssh.exe" "dist/$asset/"
           Copy-Item "README.md" "dist/$asset/"
+          Copy-Item "LICENSE" "dist/$asset/"
           Compress-Archive -Path "dist/$asset" -DestinationPath "dist/$asset.zip" -Force
           $hash = (Get-FileHash "dist/$asset.zip" -Algorithm SHA256).Hash.ToLowerInvariant()
           "$hash  $asset.zip" | Out-File -Encoding ascii "dist/$asset.zip.sha256"
+          $actual = (Get-FileHash "dist/$asset.zip" -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -ne $hash) { throw "checksum verification failed for $asset.zip" }
+          Expand-Archive -Path "dist/$asset.zip" -DestinationPath "dist/verify-$asset" -Force
+          @("ustc-107-ssh.exe", "README.md", "LICENSE") | ForEach-Object {
+            if (-not (Test-Path "dist/verify-$asset/$asset/$_")) {
+              throw "missing archive member: $asset/$_"
+            }
+          }
 
       - name: Upload packaged asset
         uses: actions/upload-artifact@v4
